@@ -7,6 +7,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from app.database import get_schema, engine
 from typing import List, TypedDict, Optional
 from sqlalchemy import inspect
+from app.vectorstore import retriever
+
 
 class AgentState(TypedDict):
     history: List[BaseMessage]
@@ -45,20 +47,29 @@ def supervisor_node(state: AgentState):
 def sql_agent_node(state: AgentState):
     user_input = state["history"][-1].content
     relevant_tables = state.get("relevant_tables", [])
-    
-    partial_schema = get_schema(engine, tables=relevant_tables)
+    schema = get_schema(engine, tables=relevant_tables)
+    context = state.get("retrieved_context", "")
+    full_input = f"{context}\n\n{user_input}" if context else user_input
 
     response = sql_agent_executor.invoke({
-        "input": user_input,
+        "input": full_input,
         "history": state["history"][:-1],
-        "schema": partial_schema
+        "schema": schema
     })
     return {"history": state["history"] + [HumanMessage(content=response["output"])]}
+
 
 def general_agent_node(state: AgentState):
     user_input = state["history"][-1].content
     response = general_agent(user_input)
     return {"history": state["history"] + [HumanMessage(content=response)]}
+
+def retriever_node(state: AgentState):
+    user_input = state["history"][-1].content
+    docs = retriever.get_relevant_documents(user_input)
+    context = "\n".join([doc.page_content for doc in docs])
+    return {**state, "retrieved_context": context}
+
 
 workflow = StateGraph(AgentState)
 
@@ -66,23 +77,25 @@ workflow.add_node("supervisor", supervisor_node)
 workflow.add_node("sql_agent", sql_agent_node)
 workflow.add_node("general_agent", general_agent_node)
 
+workflow.add_node("retriever", retriever_node)
+
 def route_supervisor(state: AgentState):
     if state["next_agent"] == "sql_agent":
-        return "table_inference"
+        return "retriever"
     elif state["next_agent"] == "general_agent":
         return "general_agent"
-    else:
-        return END
+    return END
 
-workflow.add_node("table_inference", table_inference_node)
 workflow.add_conditional_edges(
     "supervisor",
     route_supervisor,
     {
-        "table_inference": "table_inference",
-        "general_agent": "general_agent",
+        "retriever": "retriever",
+        "general_agent": "general_agent"
     }
 )
+workflow.add_node("table_inference", table_inference_node)
+workflow.add_edge("retriever", "table_inference")
 workflow.add_edge("table_inference", "sql_agent")
 
 workflow.set_entry_point("supervisor")
